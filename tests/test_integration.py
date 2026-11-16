@@ -30,14 +30,15 @@ def _free_port() -> int:
 class ServerHarness:
     __test__ = False  # 非测试类，避免 pytest 误收集
 
-    def __init__(self, data_dir: Path, port: int):
+    def __init__(self, data_dir: Path, port: int, extra_env: dict | None = None):
         self.data_dir = data_dir
         self.port = port
+        self.extra_env = extra_env or {}
         self.proc: subprocess.Popen | None = None
         self.log_file: Path | None = None
         self.client = httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=30)
 
-    def start(self) -> None:
+    def start(self, wait: bool = True) -> None:
         env = {
             **os.environ,
             "PIPELINE_DATA_DIR": str(self.data_dir),
@@ -45,6 +46,7 @@ class ServerHarness:
             "PIPELINE_KILL_GRACE_SECONDS": "10",
             "PIPELINE_PROC_POLL_INTERVAL": "0.05",
             "PIPELINE_SCHEDULER_TICK": "0.05",
+            **self.extra_env,
         }
         # 输出落文件而不是 PIPE：管道缓冲写满会冻结 uvicorn 事件循环
         self.log_file = self.data_dir / "server.log"
@@ -68,7 +70,11 @@ class ServerHarness:
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
-        deadline = time.time() + 20
+        if wait:
+            self.wait_ready()
+
+    def wait_ready(self) -> None:
+        deadline = time.time() + 30
         while time.time() < deadline:
             try:
                 r = httpx.get(f"http://127.0.0.1:{self.port}/health", timeout=1)
@@ -372,6 +378,149 @@ def _step_pid(data_dir: Path, build_id: int, step_uid: str) -> int:
         return int(row[0])
     finally:
         conn.close()
+
+
+# --------------------------------------- 10. 强杀于"已启动未登记"窗口（固件团队上报场景）
+
+def _step_row(data_dir: Path, build_id: int, step_uid: str) -> dict | None:
+    import sqlite3
+
+    conn = sqlite3.connect(data_dir / "pipeline.db")
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT * FROM steps WHERE build_id=? AND step_uid=?",
+            (build_id, step_uid),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def _find_pid_by_token(token: str) -> int | None:
+    from app.proc import scan_marked_processes
+
+    for m in scan_marked_processes():
+        if m.token == token:
+            return m.pid
+    return None
+
+
+def test_kill_between_spawn_and_registration_recovers(tmp_path_factory):
+    """编译命令已启动、身份尚未落库时 SIGKILL：重启后孤儿进程组必须被清理，
+    工作目录不得再被旧命令修改，新构建正常放行。"""
+    data_dir = tmp_path_factory.mktemp("gap-data")
+    port = _free_port()
+    # 故障注入：把"已启动未登记"窗口拉大到 10s，确保 SIGKILL 落在窗口内
+    srv = ServerHarness(
+        data_dir, port, extra_env={"PIPELINE_SPAWN_REGISTER_DELAY_SECONDS": "10"}
+    )
+    srv.start()
+    try:
+        bid = submit(srv.client, "killed-mid-registration", [
+            step(
+                "compile",
+                "for i in $(seq 1 900); do echo tick-$i >> ticks.txt; sleep 0.2; done",
+                timeout=300,
+            ),
+        ])
+        # 等到"令牌已落库、身份未登记"（此时进程已 spawn）
+        token = None
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            row = _step_row(data_dir, bid, "compile")
+            if row and row["start_token"] and row["pid"] is None:
+                token = row["start_token"]
+                break
+            time.sleep(0.05)
+        assert token, "未能观察到启动登记窗口"
+        # 窗口期内带令牌的进程确实存在
+        orphan_pid = None
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            orphan_pid = _find_pid_by_token(token)
+            if orphan_pid:
+                break
+            time.sleep(0.05)
+        assert orphan_pid, "窗口期内应已存在带令牌的进程"
+    finally:
+        srv.stop(sig=signal.SIGKILL)  # 强杀，不给任何清理机会
+
+    # 强杀后孤儿仍在跑、仍在写工作目录（旧版本里它会永远跑下去）
+    assert Path(f"/proc/{orphan_pid}").exists()
+    ticks = data_dir / "workdir" / str(bid) / "ticks.txt"
+
+    # 同数据目录重启（无故障注入）：启动恢复必须先清残留再对外服务
+    srv2 = ServerHarness(data_dir, port)
+    srv2.start()
+    try:
+        assert_pid_dead(orphan_pid)  # 孤儿进程组已被清理
+        detail = srv2.client.get(f"/builds/{bid}").json()
+        assert detail["status"] == "interrupted"
+        assert step_map(detail)["compile"]["status"] == "interrupted"
+        # 旧命令不再修改工作目录
+        assert ticks.exists()
+        first = len(ticks.read_text().splitlines())
+        assert first > 0
+        time.sleep(1.0)
+        assert len(ticks.read_text().splitlines()) == first
+        # 名额不被幽灵占用：新构建正常跑通
+        new_id = submit(srv2.client, "after-gap", [step("z", "echo alive")])
+        assert wait_build(srv2.client, new_id)["status"] == "succeeded"
+    finally:
+        srv2.stop()
+
+
+# --------------------------------------- 11. 恢复途中再次被强杀，仍能完成清理
+
+def test_restart_during_recovery_still_cleans_up(tmp_path_factory):
+    data_dir = tmp_path_factory.mktemp("recovery-kill-data")
+    port = _free_port()
+    # 顽固进程组：整体忽略 SIGTERM，恢复必须走到 SIGKILL 才能清空
+    stubborn = "trap '' TERM; sleep 300 & sleep 300"
+    srv1 = ServerHarness(data_dir, port)
+    srv1.start()
+    try:
+        bid = submit(srv1.client, "stubborn-victim", [step("x", stubborn, timeout=300)])
+        deadline = time.time() + 10
+        victim_pid = None
+        while time.time() < deadline:
+            row = _step_row(data_dir, bid, "x")
+            if row and row["pid"]:
+                victim_pid = int(row["pid"])
+                break
+            time.sleep(0.05)
+        assert victim_pid
+        assert Path(f"/proc/{victim_pid}").exists()
+    finally:
+        srv1.stop(sig=signal.SIGKILL)
+    assert Path(f"/proc/{victim_pid}").exists()
+
+    # 第二次启动：把 SIGTERM 宽限拉大到 6s，在恢复清理途中再次强杀
+    srv2 = ServerHarness(
+        data_dir, port, extra_env={"PIPELINE_TERM_GRACE_SECONDS": "6"}
+    )
+    srv2.start(wait=False)  # 不等就绪：恢复完成前 /health 不可用
+    try:
+        time.sleep(2)  # 恢复已开始（TERM 已发出但被忽略），宽限远未结束
+    finally:
+        srv2.stop(sig=signal.SIGKILL)
+    # 清理确实没有完成，顽固进程还活着
+    assert Path(f"/proc/{victim_pid}").exists()
+
+    # 第三次启动：恢复可重入，这次走完 TERM->KILL 全流程
+    srv3 = ServerHarness(data_dir, port)
+    srv3.start()
+    try:
+        assert_pid_dead(victim_pid)
+        detail = srv3.client.get(f"/builds/{bid}").json()
+        assert detail["status"] == "interrupted"
+        assert step_map(detail)["x"]["status"] == "interrupted"
+        # 恢复报告可见
+        health = srv3.client.get("/health").json()
+        assert health["recovery"]["builds"] >= 1
+    finally:
+        srv3.stop()
 
 
 # --------------------------------------------------------------- 9. 其他接口

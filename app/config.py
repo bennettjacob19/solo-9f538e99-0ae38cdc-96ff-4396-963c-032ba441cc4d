@@ -31,6 +31,10 @@ KILL_GRACE_SECONDS = _env_float("PIPELINE_KILL_GRACE_SECONDS", "60")
 PROC_POLL_INTERVAL = _env_float("PIPELINE_PROC_POLL_INTERVAL", "0.1")
 SCHEDULER_TICK = _env_float("PIPELINE_SCHEDULER_TICK", "0.2")
 
+# 故障注入（仅测试用）：在"进程已 spawn、身份未落库"的窗口内人为睡眠，
+# 用于复现并验证"启动登记窗口期被强杀"的恢复行为。生产环境必须为 0。
+SPAWN_REGISTER_DELAY_SECONDS = _env_float("PIPELINE_SPAWN_REGISTER_DELAY_SECONDS", "0")
+
 # 日志接口单次最多返回字节数
 LOG_MAX_BYTES = int(os.environ.get("PIPELINE_LOG_MAX_BYTES", str(1024 * 1024)))
 

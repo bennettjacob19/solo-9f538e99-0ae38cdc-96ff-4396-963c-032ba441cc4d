@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS steps (
     pid             INTEGER,
     pgid            INTEGER,
     proc_starttime  REAL,
+    start_token     TEXT,
     started_at      TEXT,
     finished_at     TEXT,
     UNIQUE(build_id, step_uid),
@@ -56,6 +57,19 @@ class Database:
         await self._conn.execute("PRAGMA foreign_keys=ON")
         await self._conn.execute("PRAGMA busy_timeout=30000")
         await self._conn.executescript(_SCHEMA)
+        await self._migrate()
+
+    async def _migrate(self) -> None:
+        """兼容已有数据卷的就地迁移：旧库缺少的列逐个补齐。"""
+        assert self._conn is not None
+        cur = await self._conn.execute("PRAGMA table_info(steps)")
+        cols = {row["name"] for row in await cur.fetchall()}
+        if "start_token" not in cols:
+            # 启动令牌列（1.1.0 引入）：旧行保持 NULL，恢复时回退到
+            # PIPELINE_BUILD_ID/PIPELINE_STEP_ID 环境对识别残留进程
+            await self._conn.execute(
+                "ALTER TABLE steps ADD COLUMN start_token TEXT"
+            )
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -156,6 +170,18 @@ class Database:
     async def request_cancel(self, build_id: int) -> None:
         await self.execute(
             "UPDATE builds SET cancel_requested=1 WHERE id=?", (build_id,)
+        )
+
+    async def set_step_starting(self, step_pk: int, token: str, now: str) -> None:
+        """启动登记第一段：进程尚未 spawn，先把本次启动令牌落库。
+
+        令牌先行的意义：此后任何时刻被强杀，恢复流程都能凭进程环境里
+        的同一令牌找回已产生的进程；令牌写入前则根本不存在进程。
+        """
+        await self.execute(
+            "UPDATE steps SET start_token=?, status='starting', "
+            "started_at=COALESCE(started_at, ?) WHERE id=?",
+            (token, now, step_pk),
         )
 
     async def set_step_process(

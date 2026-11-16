@@ -8,7 +8,8 @@ from pydantic import BaseModel, Field, field_validator
 from . import config
 
 # 步骤与构建的状态机
-# pending 未启动 / running 运行中 / cleaning_up 主进程已退出，正在清空进程组
+# pending 未启动 / starting 启动令牌已落库、进程启动登记中 /
+# running 运行中 / cleaning_up 主进程已退出，正在清空进程组
 # succeeded / failed / skipped / cancelled / interrupted 均为终态
 STEP_TERMINAL = {"succeeded", "failed", "skipped", "cancelled", "interrupted"}
 BUILD_TERMINAL = {"succeeded", "failed", "cancelled", "interrupted"}

@@ -15,10 +15,11 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+from uuid import uuid4
 
 from . import config, proc
 from .db import Database
-from .models import BUILD_TERMINAL, BuildCreate, validate_dag
+from .models import STEP_TERMINAL, BUILD_TERMINAL, BuildCreate, validate_dag
 
 _STEP_FAIL_STATES = {"failed", "skipped", "cancelled", "interrupted"}
 
@@ -75,8 +76,12 @@ class Scheduler:
     async def recover(self) -> dict[str, int]:
         """API 启动时执行：先清理旧构建残留进程，再统一标记 interrupted。
 
-        旧构建之外的进程（PID 已被复用、starttime 对不上）绝不动。
-        恢复期间不恢复调度，未跑步骤一律不再启动。
+        识别残留走两条互相补盲的路径（详见 _cleanup_step_residue）：
+        已登记身份的双重校验 + 环境标记扫描。旧构建之外的进程（PID 已被
+        复用、标记对不上）绝不动。所有残留清空前不标记中断、不对外服务
+        （lifespan 在 recover 返回后才放行请求）；恢复不恢复调度，
+        未跑步骤一律不再启动。恢复可重入：途中再次被强杀，下次启动
+        重新执行本函数仍能完成清理。
         """
         stale = await self.db.list_nonterminal_builds()
         if not stale:
@@ -90,50 +95,26 @@ class Scheduler:
         killed_groups = 0
         for build in stale:
             build_id = build["id"]
-            for step in grouped.get(build_id, []):
-                if step["status"] not in ("running", "cleaning_up"):
+            steps = grouped.get(build_id, [])
+            # 第一步：清残留。全部步骤清理完成后才允许标记中断
+            for step in steps:
+                if step["status"] in STEP_TERMINAL:
                     continue
-                pgid = step["pgid"]
-                pid = step["pid"]
-                starttime = step["proc_starttime"]
-                if not pgid:
+                if await self._cleanup_step_residue(build_id, step):
+                    killed_groups += 1
+            # 第二步：残留已清空，才把非终态步骤与构建标记为 interrupted
+            for step in steps:
+                if step["status"] in STEP_TERMINAL:
                     continue
-                note: Optional[str] = None
-                identity_ok = bool(
-                    pid
-                    and proc.is_same_process(pid, starttime)
-                    and _safe_getpgid(pid) == pgid
+                await self.db.set_step_status(
+                    step["id"],
+                    "interrupted",
+                    _now(),
+                    detail="API 进程重启，步骤被标记中断，不再启动",
                 )
-                members = await asyncio.to_thread(proc.list_pgid_members, pgid)
-                if identity_ok:
-                    note = "API 重启恢复：进程身份确认，终止旧进程组"
-                elif members:
-                    # 组长已死但组内仍有成员：组未空，pgid 不可能被复用，成员即残留
-                    note = "API 重启恢复：组长已退出但组内仍有残留成员，强制清理"
-                if note is None:
-                    continue
-                log_lines = [f"[runner] {note} build={build_id} step={step['step_uid']}"]
-                cleared = await proc.terminate_process_group(
-                    None, pgid, "重启清理", log_lines
+                self._append_log(
+                    step["log_path"], ["[runner] API 重启：该步骤标记为 interrupted"]
                 )
-                killed_groups += 1
-                self._append_log(step["log_path"], log_lines)
-                if not cleared:
-                    self._append_log(
-                        step["log_path"], ["[runner] 警告: 重启清理超过硬等上限仍有残留"]
-                    )
-
-            for step in grouped.get(build_id, []):
-                if step["status"] not in ("succeeded", "failed", "skipped", "cancelled"):
-                    await self.db.set_step_status(
-                        step["id"],
-                        "interrupted",
-                        _now(),
-                        detail="API 进程重启，步骤被标记中断，不再启动",
-                    )
-                    self._append_log(
-                        step["log_path"], ["[runner] API 重启：该步骤标记为 interrupted"]
-                    )
             await self.db.set_build_status(
                 build_id,
                 "interrupted",
@@ -143,6 +124,72 @@ class Scheduler:
                 finished=True,
             )
         return {"builds": len(stale), "killed_groups": killed_groups}
+
+    async def _cleanup_step_residue(self, build_id: int, step: Any) -> bool:
+        """清掉单个非终态步骤的全部残留进程；返回是否有残留被清理。
+
+        路径 A（身份已登记）：pid+starttime+pgid 三重校验一致才动组，
+        防止 PID 复用后误杀后来构建的进程。
+        路径 B（环境标记扫描）：按启动令牌（旧数据回退到
+        PIPELINE_BUILD_ID/PIPELINE_STEP_ID 环境对）在 /proc 中认出自家
+        进程，覆盖"进程已启动、身份尚未落库就被强杀"的窗口；身份失效
+        （组长已死、PID 复用）时也能凭标记确认归属，不碰无关进程。
+        """
+        step_uid = step["step_uid"]
+        log_lines: list[str] = []
+        cleaned_any = False
+
+        pid = step["pid"]
+        pgid = step["pgid"]
+        starttime = step["proc_starttime"]
+        if pid and pgid and proc.is_same_process(pid, starttime):
+            if _safe_getpgid(pid) == pgid:
+                log_lines.append(
+                    f"[runner] 重启恢复：步骤 {step_uid} 身份确认"
+                    f"(pid={pid}, pgid={pgid})，终止旧进程组"
+                )
+                cleared = await proc.terminate_process_group(
+                    None, pgid, "重启清理", log_lines
+                )
+                cleaned_any = True
+                if not cleared:
+                    log_lines.append(
+                        "[runner] 警告: 重启清理超过硬等上限仍有残留"
+                    )
+
+        token = step["start_token"]
+        build_tag = str(build_id)
+
+        def _residuals() -> list[proc.Marker]:
+            found: list[proc.Marker] = []
+            for m in proc.scan_marked_processes():
+                if token and m.token == token:
+                    found.append(m)
+                elif m.build_id == build_tag and m.step_uid == step_uid:
+                    # 旧版本没有令牌：回退到 (build, step) 环境对匹配；
+                    # 该对组合与本步骤行一一对应，不会匹配到无关进程
+                    found.append(m)
+            return found
+
+        residuals = await asyncio.to_thread(_residuals)
+        if residuals:
+            log_lines.append(
+                f"[runner] 重启恢复：步骤 {step_uid} 发现身份未登记/已失效的"
+                f"残留进程 {[m.pid for m in residuals]}，按环境标记强制清理"
+            )
+            cleared = await proc.terminate_residual_processes(
+                _residuals,
+                "重启清理",
+                log_lines,
+                seed_pgids={m.pgrp for m in residuals if m.pgrp},
+            )
+            cleaned_any = True
+            if not cleared:
+                log_lines.append("[runner] 警告: 残留进程清理超过硬等上限")
+
+        if log_lines:
+            self._append_log(step["log_path"], log_lines)
+        return cleaned_any
 
     # ------------------------------------------------------------- 构建主循环
 
@@ -281,9 +328,26 @@ class Scheduler:
 
         env = {
             **os.environ,
-            "PIPELINE_BUILD_ID": str(build_id),
-            "PIPELINE_STEP_ID": step_uid,
+            proc.ENV_BUILD_ID: str(build_id),
+            proc.ENV_STEP_ID: step_uid,
         }
+        # 启动登记两段式，关闭"进程已启动、身份未落库"的强杀窗口：
+        # 1) 先把本次启动令牌落库（此刻还没有任何进程）；
+        # 2) 再 spawn，进程环境携带同一令牌；
+        # 3) 最后登记 (pid, pgid, starttime) 身份。
+        # 此后无论在哪一步被强杀，恢复都能凭令牌/环境标记找回并清理进程；
+        # 第 1 步之前被杀则根本不存在进程。
+        token = uuid4().hex
+        env[proc.ENV_STEP_TOKEN] = token
+        try:
+            await self.db.set_step_starting(step_pk, token, _now())
+        except Exception as exc:  # 令牌未能落库：进程尚不存在，直接判失败
+            await self.db.set_step_status(
+                step_pk, "failed", _now(), detail=f"启动登记失败: {exc}"
+            )
+            self._append_log(log_path, [f"[runner] 启动登记失败: {exc}"])
+            return "failed"
+
         log_f = open(log_path, "ab", buffering=0)
         try:
             try:
@@ -297,7 +361,26 @@ class Scheduler:
                 self._append_log(log_path, [f"[runner] 进程启动失败: {exc}"])
                 return "failed"
 
-            await self.db.set_step_process(step_pk, pid, pgid, starttime, _now())
+            if config.SPAWN_REGISTER_DELAY_SECONDS > 0:
+                # 故障注入（仅测试）：放大"已启动未登记"窗口
+                await asyncio.sleep(config.SPAWN_REGISTER_DELAY_SECONDS)
+            try:
+                await self.db.set_step_process(step_pk, pid, pgid, starttime, _now())
+            except Exception as exc:
+                # 身份登记失败：进程已经产生但身份未落库，必须立即回收，
+                # 绝不允许无登记的进程继续运行
+                cleanup_log = [
+                    f"[runner] 进程身份登记失败: {exc!r}，"
+                    f"回收已启动的进程组 {pgid}"
+                ]
+                await proc.terminate_process_group(
+                    process, pgid, "身份登记失败回收", cleanup_log
+                )
+                self._append_log(log_path, cleanup_log)
+                await self.db.set_step_status(
+                    step_pk, "failed", _now(), detail=f"进程身份登记失败: {exc}"
+                )
+                return "failed"
             cancel_event = self._build_events[build_id]
             outcome, detail = await self._watch(process, timeout, cancel_event)
 

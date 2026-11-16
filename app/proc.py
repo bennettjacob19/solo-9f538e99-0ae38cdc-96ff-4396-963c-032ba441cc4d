@@ -15,11 +15,17 @@ import errno
 import os
 import signal
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Iterable, NamedTuple, Optional
 
 from . import config
 
 _PROC = Path("/proc")
+
+# 步骤进程的环境标记：进程一旦启动就携带，恢复扫描凭它们在 /proc 中
+# 认出自家进程 —— 即使进程身份还没来得及写入 SQLite。
+ENV_BUILD_ID = "PIPELINE_BUILD_ID"
+ENV_STEP_ID = "PIPELINE_STEP_ID"
+ENV_STEP_TOKEN = "PIPELINE_STEP_TOKEN"
 
 
 def read_starttime(pid: int) -> Optional[int]:
@@ -48,6 +54,74 @@ def is_same_process(pid: int, starttime: Optional[float]) -> bool:
     if current is None:
         return False
     return current == int(starttime)
+
+
+def read_pgrp(pid: int) -> Optional[int]:
+    """读取 /proc/<pid>/stat 的第 5 字段（进程组 ID）。"""
+    try:
+        data = (_PROC / str(pid) / "stat").read_text()
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        return None
+    _, _, rest = data.partition(")")
+    fields = rest.split()
+    # ')' 之后第 3 个字段即 pgrp（整体第 5 个字段）
+    if len(fields) < 3:
+        return None
+    try:
+        return int(fields[2])
+    except ValueError:
+        return None
+
+
+class Marker(NamedTuple):
+    """一个带流水线环境标记的存活进程。"""
+
+    pid: int
+    pgrp: Optional[int]
+    build_id: Optional[str]
+    step_uid: Optional[str]
+    token: Optional[str]
+
+
+def scan_marked_processes() -> list[Marker]:
+    """扫描 /proc，找出 environ 中带流水线环境标记的进程。
+
+    只能读到本进程同用户（或 root）的 environ；读不到的直接跳过，
+    匹配不上标记的绝不返回 —— 调用方据此杀进程时不会误伤无关进程。
+    """
+    marked: list[Marker] = []
+    wanted = (
+        ENV_BUILD_ID.encode() + b"=",
+        ENV_STEP_ID.encode() + b"=",
+        ENV_STEP_TOKEN.encode() + b"=",
+    )
+    for entry in _PROC.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            raw = (entry / "environ").read_bytes()
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            continue
+        if not raw:  # 内核线程/僵尸进程 environ 为空
+            continue
+        values: list[Optional[str]] = [None, None, None]
+        for item in raw.split(b"\0"):
+            for idx, prefix in enumerate(wanted):
+                if values[idx] is None and item.startswith(prefix):
+                    values[idx] = item[len(prefix):].decode(errors="replace")
+        if values[0] is None and values[1] is None and values[2] is None:
+            continue
+        marked.append(
+            Marker(
+                pid=pid,
+                pgrp=read_pgrp(pid),
+                build_id=values[0],
+                step_uid=values[1],
+                token=values[2],
+            )
+        )
+    return marked
 
 
 def list_pgid_members(pgid: int) -> list[tuple[int, str]]:
@@ -83,6 +157,13 @@ def _kill_group(pgid: int, sig: int) -> None:
     except OSError as exc:  # pragma: no cover - 极端权限场景
         if exc.errno != errno.ESRCH:
             raise
+
+
+def _kill_pid(pid: int, sig: int) -> None:
+    try:
+        os.kill(pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
 
 
 async def terminate_process_group(
@@ -151,6 +232,85 @@ async def terminate_process_group(
         except ProcessLookupError:
             pass
     log_lines.append(f"[runner] 进程组 {pgid} 已清空")
+    return True
+
+
+async def terminate_residual_processes(
+    find_residuals: Callable[[], list[Marker]],
+    reason: str,
+    log_lines: list[str],
+    *,
+    seed_pgids: Iterable[int] = (),
+    term_grace: Optional[float] = None,
+    kill_grace: Optional[float] = None,
+    poll_interval: Optional[float] = None,
+) -> bool:
+    """对环境标记扫描到的残留进程做 TERM -> KILL 的有界清理。返回是否已清空。
+
+    ``find_residuals`` 是同步可调用，每次调用都重新扫描 /proc 并返回仍存活
+    的关联进程（Marker 列表）——只匹配调用方给出的标记，绝不扩大范围。
+    清空判定：标记进程消失，且它们出现过的所有进程组内已无非僵尸成员
+    （覆盖个别子进程清洗环境变量的情形）。硬等有界，不会永久挂死恢复流程。
+    """
+    import asyncio
+
+    term_grace = config.TERM_GRACE_SECONDS if term_grace is None else term_grace
+    kill_grace = config.KILL_GRACE_SECONDS if kill_grace is None else kill_grace
+    poll_interval = config.PROC_POLL_INTERVAL if poll_interval is None else poll_interval
+
+    known_pgids: set[int] = {pg for pg in seed_pgids if pg}
+
+    def _check() -> tuple[list[Marker], bool]:
+        ms = find_residuals()
+        known_pgids.update(m.pgrp for m in ms if m.pgrp)
+        if ms:
+            return ms, True
+        for pg in known_pgids:
+            if list_pgid_members(pg):
+                return ms, True
+        return ms, False
+
+    residuals, alive = await asyncio.to_thread(_check)
+    if not alive:
+        return True
+
+    log_lines.append(
+        f"[runner] {reason}: 发现未登记残留进程 "
+        f"{[(m.pid, m.pgrp) for m in residuals]}，发送 SIGTERM"
+    )
+    for pg in sorted(known_pgids):
+        await asyncio.to_thread(_kill_group, pg, signal.SIGTERM)
+
+    loop = asyncio.get_running_loop()
+    term_deadline = loop.time() + term_grace
+    while loop.time() < term_deadline:
+        await asyncio.sleep(poll_interval)
+        residuals, alive = await asyncio.to_thread(_check)
+        if not alive:
+            break
+    if alive:
+        log_lines.append(
+            f"[runner] SIGTERM 宽限 {term_grace}s 后仍有残留，发送 SIGKILL: "
+            f"{[m.pid for m in residuals]}"
+        )
+        for pg in sorted(known_pgids):
+            await asyncio.to_thread(_kill_group, pg, signal.SIGKILL)
+        # 直接补杀个体：覆盖已脱离原进程组/会话的标记进程
+        for m in residuals:
+            await asyncio.to_thread(_kill_pid, m.pid, signal.SIGKILL)
+        kill_deadline = loop.time() + kill_grace
+        while loop.time() < kill_deadline:
+            await asyncio.sleep(poll_interval)
+            residuals, alive = await asyncio.to_thread(_check)
+            if not alive:
+                break
+    if alive:
+        log_lines.append(
+            f"[runner] 错误: 残留进程在硬等 {kill_grace}s 后仍存活: "
+            f"{[m.pid for m in residuals]}"
+        )
+        return False
+    log_lines.append("[runner] 未登记残留进程已全部清空")
     return True
 
 
